@@ -1,0 +1,4 @@
+{
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/data/sink/dp-0/7420ac37-7136-458a-a8db-22c149d9239c/chunks/7420ac37-7136-458a-a8db-22c149d9239c_0",
+  "compressionAlgorithm":"LZ4"
+}

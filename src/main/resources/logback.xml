@@ -1,0 +1,47 @@
+<configuration>
+
+<!--    <property name="NODE_ID" value="sn-00"/>-->
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="ch.qos.logback.core.encoder.LayoutWrappingEncoder">
+            <layout class="mx.cinvestav.log.MySampleLayout" >
+                <nodeId>${NODE_ID}</nodeId>
+            </layout>
+        </encoder>
+    </appender>
+
+    <timestamp key="bySecond" datePattern="yyyyMMdd'T'HHmmss"/>
+
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <!-- use the previously created timestamp to create a uniquely
+             named log file -->
+        <filter class="ch.qos.logback.classic.filter.LevelFilter">
+            <level>DEBUG</level>
+            <onMatch>ACCEPT</onMatch>
+            <onMismatch>DENY</onMismatch>
+        </filter>
+        <file>${LOG_PATH}/${NODE_ID}-${bySecond}.txt</file>
+        <encoder class="ch.qos.logback.core.encoder.LayoutWrappingEncoder">
+            <layout class="mx.cinvestav.log.MySampleLayout" >
+                <nodeId>${NODE_ID}</nodeId>
+            </layout>
+        </encoder>
+<!--        <encoder>-->
+<!--            <pattern>%logger{35} - %msg%n</pattern>-->
+<!--        </encoder>-->
+    </appender>
+
+    <root level="DEBUG">
+        <appender-ref ref="STDOUT" />
+        <appender-ref ref="FILE" />
+    </root>
+<!--    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">-->
+<!--        <encoder>-->
+<!--            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level - %msg - %elapsedTime{}%n</pattern>-->
+<!--        </encoder>-->
+<!--    </appender>-->
+
+<!--    <root level="debug">-->
+<!--        <appender-ref ref="STDOUT" />-->
+<!--    </root>-->
+</configuration>
