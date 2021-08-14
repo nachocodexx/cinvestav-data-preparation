@@ -30,6 +30,7 @@ object Main extends IOApp{
           maybeCommandId match {
             case Some(commandId) => commandId match {
               case StringVal(value)  if (value == "COMPRESS")=> CommandHandlers.compress()
+              case StringVal(value)  if (value == "DECOMPRESS")=> CommandHandlers.decompress()
               case StringVal(value)  if (value == "SLICE")=> CommandHandlers.slice()
               case StringVal(value)  if (value == "SLICE_COMPRESS")=> CommandHandlers.sliceAndCompress()
               case StringVal(value)   => ctx.logger.error(s"COMMAND_ID[$value] NOT MATCH") *> acker.reject(envelope.deliveryTag)
@@ -68,7 +69,7 @@ object Main extends IOApp{
             val routingKey = RoutingKey(s"${config.poolId}.${node.nodeId}")
             (node.nodeId,PublisherConfig(exchangeName = exchangeName,routingKey = routingKey))
           }
-            .map(x=>x.copy(_2 = PublisherV2(x._2)))
+            .map(x=>x.copy(_2 = PublisherV2.create(x._1,x._2)))
             .toMap
           initState       = NodeState(
             sourceFolders = config.sourceVolumes,

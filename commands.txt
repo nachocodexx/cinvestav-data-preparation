@@ -1,4 +1,21 @@
+________________________COMPRESS_______________________
 {
-  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/data/sink/dp-0/7420ac37-7136-458a-a8db-22c149d9239c/chunks/7420ac37-7136-458a-a8db-22c149d9239c_0",
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-0/7420ac37-7136-458a-a8db-22c149d9239c/chunks/7420ac37-7136-458a-a8db-22c149d9239c_0",
+  "compressionAlgorithm":"LZ4"
+}
+________________________DECOMPRESS_______________________
+{
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-0/7420ac37-7136-458a-a8db-22c149d9239c/compressed/7420ac37-7136-458a-a8db-22c149d9239c_0.lz4",
+  "compressionAlgorithm":"LZ4"
+}
+________________________SLICE_______________________
+{
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sources/00.pdf",
+  "chunkSize":64000000
+}
+________________________SLICE_COMPRESS_______________________
+{
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sources/00.pdf",
+  "chunkSize":64000000,
   "compressionAlgorithm":"LZ4"
 }

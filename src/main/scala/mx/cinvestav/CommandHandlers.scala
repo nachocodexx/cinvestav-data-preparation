@@ -3,11 +3,12 @@ package mx.cinvestav
 import cats.implicits._
 import cats.data.EitherT
 import cats.effect._
+import ch.qos.logback.core.util.FileSize
 import dev.profunktor.fs2rabbit.model.AmqpFieldValue.StringVal
 import dev.profunktor.fs2rabbit.model.{AmqpEnvelope, AmqpMessage, AmqpProperties}
 import io.circe.generic.auto._
-import mx.cinvestav.Declarations.{FileNotFound, NodeContext, NodeError, NodeState, PublisherNotFound, VolumeNotFound, payloads}
-import mx.cinvestav.commons.fileX.ChunkConfig
+import mx.cinvestav.Declarations.{CompressionError, FileNotFound, NodeContext, NodeError, NodeState, PublisherNotFound, VolumeNotFound, payloads}
+import mx.cinvestav.commons.fileX.{ChunkConfig, FileMetadata}
 import mx.cinvestav.utils.v2.{Acker, processMessageV2}
 import mx.cinvestav.commons.{fileX, liftFF}
 import org.typelevel.log4cats.Logger
@@ -17,6 +18,8 @@ import io.circe.syntax._
 import io.circe.generic.auto._
 import mx.cinvestav.commons.compression
 
+import concurrent.duration._
+import language.postfixOps
 import java.io.File
 import java.util.UUID
 import mx.cinvestav.commons.stopwatch.StopWatch._
@@ -50,7 +53,7 @@ object CommandHandlers {
         chunksSink          = nodeVolume.resolve(fileId.toString)
         sourceFile          = new File(payload.sourcePath)
         sourceFileSize      =  sourceFile.length()
-        metadata            = fileX.metadataFromPath(sourcePath = sourceFile.toPath)
+        metadata            = FileMetadata.fromPath(path = sourceFile.toPath)
         filename            = metadata.filename
         extension           = metadata.extension
         chunkSize           = 64000000
@@ -95,8 +98,17 @@ object CommandHandlers {
                 sourcePath = chunkInfo.sourcePath,
                 compressionAlgorithm = payload.compressionAlgorithm
               ).asJson.noSpaces
-              val message =AmqpMessage(payload = compressPayload,properties = props)
-              publisher.publish(message) *> ctx.logger.debug(s"COMPRESS ${chunkInfo.index} ${chunkInfo.sourcePath}")
+              val message = AmqpMessage(payload = compressPayload,properties = props)
+              for {
+                _ <- ctx.logger.debug(s"COMPRESS ${chunkInfo.index} ${publisher.pubId} ${chunkInfo.sourcePath}")
+                _ <- publisher.publish(message)
+//                chunk = new File(chunkInfo.sourcePath)
+//                deleteDelay = 1200
+//                _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkInfo.index} ${chunkInfo.metadata.size.value.getOrElse(0)}")).start
+              } yield ()
+
+//              publisher.publish(message) *>
+//                ctx.logger.debug(s"COMPRESS ${chunkInfo.index} ${chunkInfo.sourcePath}")
         }.compile.drain
         )
 //        publisher = currentState
@@ -119,6 +131,9 @@ object CommandHandlers {
     )
 
   }
+
+
+
   def slice()(implicit ctx:NodeContext, envelope:AmqpEnvelope[String], acker:Acker): IO[Unit] = {
     def successCallback(payload:payloads.Slice) = {
       type E                       = NodeError
@@ -139,7 +154,7 @@ object CommandHandlers {
         chunksSink     = nodeVolume.resolve(fileId.toString)
         sourceFile     = new File(payload.sourcePath)
         sourceFileSize =  sourceFile.length()
-        metadata       = fileX.metadataFromPath(sourcePath = sourceFile.toPath)
+        metadata       = FileMetadata.fromPath(path = sourceFile.toPath)
         filename       = metadata.filename
         extension      = metadata.extension
         chunkSize      = 64000000
@@ -193,6 +208,9 @@ object CommandHandlers {
 
   }
 
+
+
+
   def compress()(implicit ctx:NodeContext,envelope:AmqpEnvelope[String],acker:Acker): IO[Unit] = {
     def successCallback(payload:payloads.Compress) = {
       type E                = NodeError
@@ -203,31 +221,44 @@ object CommandHandlers {
       implicit val rabbitMQContext = ctx.rabbitContext
 
       val app = for {
-        _                    <- L.debug(s"COMPRESS_DATA ${payload.sourcePath}")
+        currentState         <- maybeCurrentState
         compressionAlgorithm = compression.fromString(payload.compressionAlgorithm)
         source               = payload.sourcePath
         sourcePath           = Paths.get(source)
+//       /data
         sourceNameCount      = sourcePath.getNameCount
+//       $FILE_ID
         chunkName            = sourcePath.subpath(sourceNameCount-1,sourceNameCount).toString
-        destinationPath      = sourcePath.subpath(0,sourceNameCount-2).resolve("compressed")
-//          .toAbsolutePath
+//        /data/$FILE_ID/compressed
+        destinationPath      = Paths.get("/").resolve(sourcePath.subpath(0,sourceNameCount-2))
+          .resolve("compressed")
         destinationFile      = destinationPath.toFile
+//       ________________________________________________
         res <- liftFF[Boolean,E](IO.delay{destinationFile.mkdir()})
-//        _ <- if(destinationFile.exists()) unit
-//        else liftFF[Unit,E](IO.delay{destinationFile.mkdir()})
+        _ <- L.debug(s"SOURCE $source")
+        _ <- L.debug(s"SOURCE_EXISTS ${sourcePath.toFile.exists()}")
         _ <- L.debug(s"CHUNK_NAME $chunkName")
         _ <- L.debug(s"CHUNK_DESTINATION $destinationPath")
         _ <- L.debug(s"CHUNK_DESTINATION_FILE $destinationFile")
         _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${destinationFile.exists()}")
         _ <- L.debug(s"RES $res")
-//        result <- compression.compress(compressionAlgorithm,source = source,destination = destinationPath.toString)
-      } yield ( )
+//       ___________________________________________________________
+        result <- compression
+          .compress(compressionAlgorithm,source = source,destination = destinationPath.toString)
+          .leftMap(e=>CompressionError(e.getMessage))
+        _ <- L.debug(result.toString)
+      } yield result
 
       app.value.stopwatch.flatMap {result=>
         result.result match {
           case Left(e) =>  ctx.logger.error(e.getMessage) *> acker.reject(envelope.deliveryTag)
           case Right(value) => for {
              _ <- acker.ack(envelope.deliveryTag)
+             sourcePath    = Paths.get(payload.sourcePath)
+             chunkMetadata = FileMetadata.fromPath(sourcePath)
+             chunk         = sourcePath.toFile
+             deleteDelay    = 1200
+             _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkMetadata.filename} ${chunkMetadata.size.value.getOrElse(0)}")).start
              _ <- ctx.logger.info(s"COMPRESSION_DATA ${result.duration}")
           } yield ()
         }
@@ -241,5 +272,70 @@ object CommandHandlers {
     )
 
   }
+
+
+  def decompress()(implicit ctx:NodeContext,envelope:AmqpEnvelope[String],acker:Acker): IO[Unit] = {
+    def successCallback(payload:payloads.Decompress) = {
+      type E                = NodeError
+      val maybeCurrentState = EitherT.liftF[IO,E,NodeState](ctx.state.get)
+      val unit                     = liftFF[Unit,NodeError](IO.unit)
+      implicit val logger   = ctx.logger
+      val L                 = Logger.eitherTLogger[IO,E]
+      implicit val rabbitMQContext = ctx.rabbitContext
+
+      val app = for {
+        currentState         <- maybeCurrentState
+        compressionAlgorithm = compression.fromString(payload.compressionAlgorithm)
+        source               = payload.sourcePath
+        sourcePath           = Paths.get(source)
+        //       /data
+        sourceNameCount      = sourcePath.getNameCount
+        //       $FILE_ID
+        chunkName            = sourcePath.subpath(sourceNameCount-1,sourceNameCount).toString
+        //        /data/$FILE_ID/compressed
+        destinationPath      = Paths.get("/").resolve(sourcePath.subpath(0,sourceNameCount-2))
+          .resolve("decompressed")
+        destinationFile      = destinationPath.toFile
+        //       ________________________________________________
+        res <- liftFF[Boolean,E](IO.delay{destinationFile.mkdir()})
+        _ <- L.debug(s"SOURCE $source")
+        _ <- L.debug(s"SOURCE_EXISTS ${sourcePath.toFile.exists()}")
+        _ <- L.debug(s"CHUNK_NAME $chunkName")
+        _ <- L.debug(s"CHUNK_DESTINATION $destinationPath")
+        _ <- L.debug(s"CHUNK_DESTINATION_FILE $destinationFile")
+        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${destinationFile.exists()}")
+        _ <- L.debug(s"DESTINATION_MKDIR_RESULT $res")
+        //       ___________________________________________________________
+        result <- compression
+          .decompress(compressionAlgorithm,source = source,destination = destinationPath.toString)
+          .leftMap(e=>CompressionError(e.getMessage))
+        _ <- L.debug(result.toString)
+      } yield result
+
+      app.value.stopwatch.flatMap {result=>
+        result.result match {
+          case Left(e) =>  ctx.logger.error(e.getMessage) *> acker.reject(envelope.deliveryTag)
+          case Right(value) => for {
+            _ <- acker.ack(envelope.deliveryTag)
+//          DELETE_COMPRESSED_FILE
+            sourcePath    = Paths.get(payload.sourcePath)
+            chunkMetadata = FileMetadata.fromPath(sourcePath)
+            chunk         = sourcePath.toFile
+            deleteDelay    = 1200
+            _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkMetadata.filename} ${chunkMetadata.size.value.getOrElse(0)}")).start
+            _ <- ctx.logger.info(s"DECOMPRESSION_DATA ${result.duration}")
+          } yield ()
+        }
+      }
+    }
+
+    processMessageV2[IO,payloads.Decompress,NodeContext](
+      successCallback =  successCallback,
+      errorCallback =  e=>ctx.logger.error(e.getMessage) *> acker.reject(deliveryTag = envelope.deliveryTag),
+
+    )
+
+  }
+
 
 }

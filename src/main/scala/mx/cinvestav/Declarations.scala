@@ -8,6 +8,9 @@ import mx.cinvestav.commons.balancer.LoadBalancer
 
 object Declarations {
   trait NodeError extends Error
+  case class CompressionError(message:String) extends  NodeError {
+    override def getMessage: String = message
+  }
   case class PublisherNotFound() extends NodeError{
     override def getMessage: String = s"Publisher not found"
   }
@@ -31,6 +34,10 @@ object Declarations {
                         )
 //  __________________________-
   object payloads {
+  case class Decompress(
+                       sourcePath:String,
+                       compressionAlgorithm:String
+                     )
   case class Compress(
                        sourcePath:String,
                        compressionAlgorithm:String
