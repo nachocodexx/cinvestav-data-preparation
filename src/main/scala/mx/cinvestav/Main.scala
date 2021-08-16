@@ -3,7 +3,7 @@ import cats.effect.{ExitCode, IO, IOApp}
 import dev.profunktor.fs2rabbit.config.Fs2RabbitConfig
 import dev.profunktor.fs2rabbit.model.AmqpFieldValue.StringVal
 import dev.profunktor.fs2rabbit.model.{ExchangeName, QueueName, RoutingKey}
-import mx.cinvestav.Declarations.{NodeContext, NodeState}
+import mx.cinvestav.Declarations.{NodeContext, NodeState, Task}
 import mx.cinvestav.commons.balancer.LoadBalancer
 import mx.cinvestav.config.DefaultConfig
 import mx.cinvestav.utils.RabbitMQUtils
@@ -29,10 +29,17 @@ object Main extends IOApp{
           implicit val acker: Acker = Acker(_acker)
           maybeCommandId match {
             case Some(commandId) => commandId match {
-              case StringVal(value)  if (value == "COMPRESS")=> CommandHandlers.compress()
-              case StringVal(value)  if (value == "DECOMPRESS")=> CommandHandlers.decompress()
-              case StringVal(value)  if (value == "SLICE")=> CommandHandlers.slice()
               case StringVal(value)  if (value == "SLICE_COMPRESS")=> CommandHandlers.sliceAndCompress()
+              case StringVal(value)  if (value == "SLICE")=> CommandHandlers.slice()
+              case StringVal(value)  if (value == "COMPRESS")=> CommandHandlers.compress()
+              case StringVal(value)  if (value == "COMPRESS_COMPLETED")=> CommandHandlers.compressCompleted()
+//            _________________________________________________________________________________________________
+              case StringVal(value) if (value =="MERGE_DECOMPRESS") => CommandHandlers.mergeAndDecompress()
+              case StringVal(value)  if (value == "MERGE")=> CommandHandlers.merge()
+//              case StringVal(value)  if (value == "MERGE_COMPLETED")=> CommandHandlers.mergeCompleted()
+              case StringVal(value)  if (value == "DECOMPRESS")=> CommandHandlers.decompress()
+              case StringVal(value)  if (value == "DECOMPRESS_COMPLETED")=> CommandHandlers.decompressCompleted()
+              //        _ <- L.debug(s"MERGE_COMPRESS ${payload.sourcePath}")
               case StringVal(value)   => ctx.logger.error(s"COMMAND_ID[$value] NOT MATCH") *> acker.reject(envelope.deliveryTag)
             }
             case None => for {
@@ -74,7 +81,8 @@ object Main extends IOApp{
           initState       = NodeState(
             sourceFolders = config.sourceVolumes,
             publishers    = publishers,
-            loadBalancer  = LoadBalancer("RB")
+            loadBalancer  = LoadBalancer("RB"),
+            pendingTasks = Map.empty[String,Task]
           )
           state           <- IO.ref(initState)
           context         = NodeContext(state=state,rabbitContext = rabbitContext,logger = unsafeLogger,config=config)

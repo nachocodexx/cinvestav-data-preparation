@@ -13,9 +13,20 @@ ________________________SLICE_______________________
   "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sources/00.pdf",
   "chunkSize":64000000
 }
+________________________MERGE_______________________
+{
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-0/c5a4dc33-6c23-4819-91f9-6881849831aa/decompressed"
+}
 ________________________SLICE_COMPRESS_______________________
 {
   "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sources/00.pdf",
   "chunkSize":64000000,
   "compressionAlgorithm":"LZ4"
+}
+________________________MERGE_DECOMPRESS_______________________
+{
+  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-0/878ab040-cb77-4a99-82a4-9b019b0d1505/compressed",
+  "compressionAlgorithm":"LZ4",
+  "filename":"my_book",
+  "extension":"pdf"
 }
