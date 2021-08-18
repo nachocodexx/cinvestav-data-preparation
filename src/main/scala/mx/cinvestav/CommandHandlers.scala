@@ -4,19 +4,20 @@ import cats.implicits._
 import cats.data.EitherT
 import cats.effect._
 import ch.qos.logback.core.util.FileSize
+import com.github.gekomad.scalacompress.DecompressionStats
 import dev.profunktor.fs2rabbit.model.AmqpFieldValue.StringVal
 import dev.profunktor.fs2rabbit.model.{AmqpEnvelope, AmqpMessage, AmqpProperties}
 import io.circe.generic.auto._
-import mx.cinvestav.Declarations.{CompressionError, CompressionSubTask, CompressionTask, DecompressionSubTask, DecompressionTask, FileNotFound, MergeError, NoMessageId, NoReplyTo, NodeContext, NodeError, NodeState, PathIsNotDirectory, PublisherNotFound, Task, TaskNotFound, VolumeNotFound, payloads}
+import mx.cinvestav.Declarations.{ChunkLocation, CompressionError, CompressionSubTask, CompressionTask, DecompressionSubTask, DecompressionTask, DownloadError, FileNotFound, MergeError, NoMessageId, NoReplyTo, NodeContext, NodeError, NodeState, PathIsNotDirectory, PublisherNotFound, Task, TaskNotFound, VolumeNotFound, payloads}
 import mx.cinvestav.commons.fileX.{ChunkConfig, Extension, FileMetadata, Filename}
-import mx.cinvestav.utils.v2.{Acker, PublisherV2, processMessageV2}
+import mx.cinvestav.utils.v2.{Acker, PublisherV2, fromNodeToPublisher, processMessageV2}
 import mx.cinvestav.commons.{fileX, liftFF}
 import org.typelevel.log4cats.Logger
 import fs2.Stream
 import io.circe._
 import io.circe.syntax._
 import io.circe.generic.auto._
-import mx.cinvestav.Declarations.payloads.CompressCompleted
+import mx.cinvestav.Declarations.payloads.{CompressCompleted, CompressedChunkLocation}
 import mx.cinvestav.commons.compression
 
 import concurrent.duration._
@@ -25,7 +26,11 @@ import java.io.File
 import java.util.UUID
 import mx.cinvestav.commons.stopwatch.StopWatch._
 import mx.cinvestav.utils.v2.encoders._
+import mx.cinvestav.commons.fileX.downloadFromURL
+import mx.cinvestav.commons.nodes.Node
+import mx.cinvestav.server.Client
 
+import java.net.URL
 import java.nio.file.Paths
 
 object CommandHandlers {
@@ -95,53 +100,95 @@ object CommandHandlers {
       val L                        = Logger.eitherTLogger[IO,E]
       implicit val rabbitMQContext = ctx.rabbitContext
       val app = for {
+//      GET TIMESTAMP
+        _ <- L.debug("MERGE_INIT")
         timestamp           <- liftFF[Long,NodeError](IO.realTime.map(_.toSeconds))
+        //       CURRENT STATE
         currentState        <- maybeCurrentState
+        //       NODE_ID
         nodeId              = ctx.config.nodeId
+        //       TASK_ID
         decompressTaskId    =  UUID.randomUUID().toString
-        sourcePath          = payload.sourcePath
-        sourceFile          = new File(sourcePath)
-        isDirectory         = Either.cond[NodeError,Unit](sourceFile.isDirectory,(),PathIsNotDirectory())
-        _                   <- EitherT.fromEither[IO](isDirectory)
+        compressedChunks         = payload.compressedChunks
+        chunksMetadata = compressedChunks
+          .flatMap(_.sources)
+          .map(Paths.get(_))
+          .map(FileMetadata.fromPath)
+//        _ <- L.debug(compressedChunksMetadata.mkString(","))
+        //  FILE_ID
+        fileId              = payload.fileId
+        //
+        sinkFolder          = s"${ctx.config.sinkFolder}/$nodeId/$fileId/compressed"
+        sinkFolderPath      = Paths.get(sinkFolder)
+        _                   = sinkFolderPath.toFile.mkdirs()
+//        chunksMetadata      <- liftFF[List[FileMetadata],NodeError](
+//          Helpers.downloadCompressedChunks(compressedChunks,sinkFolderPath)
+//        )
+        // AVAILABLE DP nodes
         dataPreparationNodes = ctx.config.dataPreparationNodes
-        nodeIds             = dataPreparationNodes.map(_.nodeId).filter(_!=nodeId)
-        chunksFile          = sourceFile.listFiles().toList
-        chunksMetadata      = chunksFile.map(_.toPath).map(FileMetadata.fromPath)
-        totalNumberOfChunks = chunksFile.length
-        balancedNodes       = currentState.loadBalancer.balanceMulti(nodes = nodeIds,rounds = totalNumberOfChunks,allowRep = true)
-        pubs                <- EitherT.fromEither[IO](balancedNodes.traverse(currentState.publishers.get).toRight{PublisherNotFound()})
-        subTasks            = (chunksMetadata zip balancedNodes)
+        nodeIds              = dataPreparationNodes.map(_.nodeId).filter(_!=nodeId)
+        balancedNodes        = currentState.loadBalancer.balanceMulti(nodes = nodeIds,rounds = compressedChunks.length,allowRep = true)
+        pubs                 <- EitherT.fromEither[IO](balancedNodes.traverse(currentState.publishers.get).toRight{PublisherNotFound()})
+        pubsStream           = Stream.emits(pubs).covary[IO]
+        subTasks             = (chunksMetadata zip balancedNodes)
           .map{
             case (chm,nId) =>
-              DecompressionSubTask(chm.filename.value,taskId = decompressTaskId,nodeId = nId)
+              DecompressionSubTask(id=chm.filename.value,taskId = decompressTaskId,nodeId = nId)
           }
-        pubsStream     = Stream.emits(pubs).covary[IO]
         filename       = Filename(payload.filename)
         extension      = Extension(payload.extension)
-        decompressTask = DecompressionTask(id=decompressTaskId,subTasks = subTasks,startedAt = timestamp,filename = filename,extension = extension,sourcePath = sourcePath )
+        decompressTask = DecompressionTask(
+          id         = decompressTaskId,
+          subTasks   = subTasks,
+          startedAt  = timestamp,
+          filename   = filename,
+          extension  = extension
+//          sourcePath = ""
+        )
         newTask       = (decompressTaskId->  decompressTask)
         newState      <- liftFF[NodeState,NodeError](ctx.state.updateAndGet(s=>s.copy(pendingTasks = s.pendingTasks+newTask)))
-        _             <- L.debug(newState.toString)
+//        _             <- L.debug(newState.toString)
         _             <- liftFF[Unit,NodeError](
           rabbitMQContext.client.createChannel(conn = rabbitMQContext.connection).use{ implicit channel=>
-            Stream
-              .emits(chunksFile)
-              .zip(pubsStream)
-              .covary[IO]
-              .evalMap{
-                case (chunk, publisher) =>
-                  val messagePayload = payloads.Decompress(sourcePath = chunk.toPath.toString,compressionAlgorithm = payload.compressionAlgorithm).asJson.noSpaces
+            val data = pubsStream zip Stream.emits(compressedChunks)
+            data.evalMap{
+              case (publisher, chunkLocation) =>
+                  val messagePayload = payloads.Decompress(
+                    compressionAlgorithm = payload.compressionAlgorithm,
+                    fileId = fileId,
+                    compressedChunksLocations= chunkLocation::Nil
+                  ).asJson.noSpaces
+
                   val properties = AmqpProperties(
-                    headers = Map("commandId"->StringVal("DECOMPRESS")) ,
-                    replyTo = nodeId.some,
-                    messageId = decompressTaskId.some
+                            headers = Map("commandId"->StringVal("DECOMPRESS")) ,
+                            replyTo = nodeId.some,
+                            messageId = decompressTaskId.some
                   )
                   val message = AmqpMessage(payload = messagePayload,properties = properties)
-                  publisher.publishWithChannel(message) *> ctx.logger.debug(s"${publisher.pubId} $chunk")
-              }
-              .compile.drain
+                  publisher.publishWithChannel(message)
+//                *> ctx.logger.debug(s"${publisher.pubId} $chunk")
+//                IO.unit
+            }.compile.drain
           }
         )
+//            Stream
+//              .emits(chunksFile)
+//              .zip(pubsStream)
+//              .covary[IO]
+//              .evalMap{
+//                case (chunk, publisher) =>
+//                  val messagePayload = payloads.Decompress(sourcePath = chunk.toPath.toString,compressionAlgorithm = payload.compressionAlgorithm).asJson.noSpaces
+//                  val properties = AmqpProperties(
+//                    headers = Map("commandId"->StringVal("DECOMPRESS")) ,
+//                    replyTo = nodeId.some,
+//                    messageId = decompressTaskId.some
+//                  )
+//                  val message = AmqpMessage(payload = messagePayload,properties = properties)
+//                  publisher.publishWithChannel(message) *> ctx.logger.debug(s"${publisher.pubId} $chunk")
+//              }
+//              .compile.drain
+//          }
+//        )
       } yield ()
 //    _______________________________________________________-
       app.value.stopwatch.flatMap{ result =>
@@ -172,40 +219,67 @@ object CommandHandlers {
       val L                        = Logger.eitherTLogger[IO,E]
       implicit val rabbitMQContext = ctx.rabbitContext
       val app = for {
+//      get current time
         timestamp           <- liftFF[Long,NodeError](IO.realTime.map(_.toSeconds))
+//      get current state
         currentState        <- maybeCurrentState
+//      URL
+        url                 = new URL(payload.url)
+        urlPath             = Paths.get(url.getPath)
+        urlMetadata         = FileMetadata.fromPath(urlPath)
+//       NODE_ID
         nodeId              = ctx.config.nodeId
-        poolId              = ctx.config.poolId
         nodeIds             = ctx.config.dataPreparationNodes.map(_.nodeId).filter(_!=nodeId)
-        _                   <- L.debug(currentState.loadBalancer.counter.toString)
-        sinkVolume          <- EitherT.fromEither[IO](ctx.config.sinkVolumes.headOption.toRight{VolumeNotFound("")})
-        sinkFile            = new File(sinkVolume)
-        nodeVolume          = sinkFile.toPath.resolve(nodeId)
+//      FILE_ID
         fileId              = UUID.randomUUID()
+//      TASK_ID
         compressionTaskId   = UUID.randomUUID().toString
-        chunksSink          = nodeVolume.resolve(fileId.toString)
-        sourceFile          = new File(payload.sourcePath)
+//      SINK_FOLDER
+        sinkFolder          = ctx.config.sinkFolder
+        sinkFile            = new File(sinkFolder)
+//      SINK_FOLDER/NODE_ID
+        nodeVolume          = sinkFile.toPath.resolve(nodeId)
+//      SINK_FOLDER/NODE_ID/FILE_ID
+        fileIdWithExtension = fileId+"."+urlMetadata.extension.value
+        chunksSink          = nodeVolume
+          .resolve(fileId.toString)
+          .resolve(fileIdWithExtension)
+//      RESOURCE_URL
+        resourceURL         = s"http://${currentState.ip}:${ctx.config.port}"
+//       OUPUT_PATH
+        outputPath          = nodeVolume.resolve(Paths.get(fileId.toString))
+//      CREATE OUTPUT_FOLDER
+         _                  = outputPath.toFile.mkdirs()
+//      DOWNLOAD THE FILE FROM SERVER
+        _                   <- EitherT.fromEither[IO](
+          downloadFromURL(url,chunksSink.toFile)
+            .leftMap(DownloadError)
+        )
+        //      ________________________________________________________________
+//      SINK_FOLDER/NODE_ID/FILE_ID
+        sourceFile          =  chunksSink.toFile
         sourceFileSize      =  sourceFile.length()
+        //      ________________________________________________________________
+//      METADATA
         metadata            = FileMetadata.fromPath(path = sourceFile.toPath)
         filename            = metadata.filename
         extension           = metadata.extension
-        chunkSize           = 64000000
+//      CHUNKS DATAAAAAAA
+        chunkSize           = payload.chunkSize
         proportion          = sourceFileSize.toDouble / chunkSize.toDouble
         intNumberOfChunks   = proportion.toInt
         totalNumberOfChunks = if(sourceFileSize < chunkSize) 1 else math.ceil(proportion).toInt
         chunkSizeDecimal    = proportion-intNumberOfChunks
         chunkConfig    = ChunkConfig(
-          outputPath = chunksSink,
-          prefix = fileId.toString,
-          size = chunkSize
+          outputPath = outputPath,
+          prefix     = fileId.toString,
+          size       = chunkSize.toInt
         )
         //       ______________________________________________________
         fileNotFound       = FileNotFound(filename.value)
-        sinkVolumeNotFound = VolumeNotFound(sinkFile.toString)
         sourceCondition    = Either.cond[NodeError,Boolean](sourceFile.exists(),right = true,fileNotFound)
-//        sinkCondition      = Either.cond[NodeError,Boolean](sinkFile.exists(),right = true,sinkVolumeNotFound)
         _            <- EitherT.fromEither[IO](sourceCondition)
-//        _            <- EitherT.fromEither[IO](sinkCondition)
+        _            <- L.debug("RESOURCE_URL "+resourceURL)
         _            <- L.debug("EXTENSION "+extension)
         _            <- L.debug("FILE_NAME "+filename)
         _            <- L.debug("SOURCE "+sourceFile)
@@ -216,15 +290,19 @@ object CommandHandlers {
         _            <- L.debug(s"NUM_CHUNKS $totalNumberOfChunks")
         _            <- L.debug(s"PROPORTION $proportion")
         _            <- L.debug(s"CHUNKS ${intNumberOfChunks}x$chunkSize ${chunkSizeDecimal*chunkSize}x1")
-//      ________________________________________________________________________________________________________________
+        //      ________________________________________________________________________________________________________________
+//       SLICES
         sliceStream            = fileX.splitFile(sourceFile,chunkConfig =chunkConfig,maxConcurrent = 6 )
+//      LOAD BALANCER
         balancedNodes          = currentState.loadBalancer.balanceMulti(nodes = nodeIds,rounds = totalNumberOfChunks,allowRep = true)
+//
         pubs                   <- EitherT.fromEither[IO](balancedNodes.traverse(currentState.publishers.get).toRight{PublisherNotFound()})
         pubsStream             = Stream.emits(pubs).covary[IO]
-//      ________________________________________________________________________________________________________________
+        //      ________________________________________________________________________________________________________________
         compressChunks = rabbitMQContext.client.createChannel(conn = rabbitMQContext.connection)  .use{ implicit channel =>
           sliceStream.zip(pubsStream).evalMap{
             case (chunkInfo, publisher) =>
+//            _____________________________________________________________________
               val props   = AmqpProperties(
                 headers = Map(
                   "commandId" -> StringVal("COMPRESS")
@@ -232,10 +310,14 @@ object CommandHandlers {
                 replyTo = nodeId.some,
                 messageId = compressionTaskId.some
               )
+//            _____________________________________________________________________
               val compressPayload = payloads.Compress(
-                sourcePath = chunkInfo.sourcePath,
-                compressionAlgorithm = payload.compressionAlgorithm
+                fileId=fileId.toString,
+                url = resourceURL,
+                compressionAlgorithm = payload.compressionAlgorithm,
+                source = chunkInfo.sourcePath
               ).asJson.noSpaces
+//            _____________________________________________________________________
               val message = AmqpMessage(payload = compressPayload,properties = props)
               for {
                 _ <- ctx.logger.debug(s"COMPRESS ${chunkInfo.index} ${publisher.pubId} ${chunkInfo.sourcePath}")
@@ -244,13 +326,19 @@ object CommandHandlers {
 
           }.compile.toVector.map(_.toList)
         }
-//      ____________________________________________________________
+        //      ____________________________________________________________
         chunkInfos        <- liftFF(compressChunks)
         subTasks          = (balancedNodes zip chunkInfos).map{
           case (nId, info) =>
             CompressionSubTask(id=s"${fileId}_${info.index}",nodeId = nId,taskId = compressionTaskId)
         }
-        pendingCompressionTask = CompressionTask(id = UUID.randomUUID().toString,subTasks = subTasks,startedAt=timestamp)
+        pendingCompressionTask = CompressionTask(
+          id        = fileId.toString ,
+          subTasks  = subTasks,
+          startedAt = timestamp,
+          filename  = fileIdWithExtension,
+          userId    = payload.userId
+        )
         newTask = (compressionTaskId->pendingCompressionTask)
         updatedState           <- liftFF[NodeState,NodeError](ctx.state.updateAndGet(s=>s.copy(pendingTasks = s.pendingTasks + newTask  )))
         _ <-L.debug(updatedState.toString)
@@ -366,19 +454,52 @@ object CommandHandlers {
       val app = for {
         timestamp    <- liftFF[Long,NodeError](IO.realTime.map(_.toSeconds))
         currentState <- maybeCurrentState
+        nodeId       = ctx.config.nodeId
+        poolId       = ctx.config.poolId
+        loadBalancerId = ctx.config.loadBalancer
         taskId       <- maybeMessageId
-        _            <- L.debug(s"COMPRESS_COMPLETED $taskId ${payload.subTaskId}")
+        _            <- L.debug(s"COMPRESS_COMPLETED $taskId ${payload.subTaskId} ${payload.source}")
         _            <- L.debug(currentState.pendingTasks.mkString(","))
         task         <-  EitherT.fromEither[IO](currentState.pendingTasks.get(taskId).toRight{TaskNotFound(taskId)})
         compressTask = task.asInstanceOf[CompressionTask]
-        updatedTask  = compressTask.copy(subTasks = compressTask.subTasks.filter(_.id!= payload.subTaskId))
+        newChunkLoc = ChunkLocation(url= payload.url,source = payload.source)
+        updatedTask  = compressTask.copy(
+          subTasks = compressTask.subTasks.filter(_.id!= payload.subTaskId),
+          chunkLocations = compressTask.chunkLocations :+ newChunkLoc
+        )
         newState     <- liftFF[NodeState,NodeError]{
           ctx.state.updateAndGet(s=>s.copy(pendingTasks =  s.pendingTasks.updated(taskId,updatedTask) ))
         }
         newTask     <- EitherT.fromOption[IO].apply[NodeError,Task](newState.pendingTasks.get(taskId),TaskNotFound(taskId))
-        _           <- L.debug(newTask.toString)
-        _ <- if(newTask.subTasks.isEmpty)
-          L.debug(s"COMPRESSION_TASK_DONE $taskId ${timestamp-newTask.startedAt}")
+        newCompressTask = newTask.asInstanceOf[CompressionTask]
+//       _________________________________________
+
+        sourceMetadata = FileMetadata.fromPath(Paths.get(payload.source))
+        oldChunkName   = sourceMetadata.filename.value
+        oldChunkPath   = s"${ctx.config.sinkFolder}/$nodeId/${compressTask.id}/chunks/$oldChunkName"
+        chunk          = new File(oldChunkPath)
+        _              <- liftFF[Unit,NodeError](IO.delay{chunk.delete()} )
+        _              <- L.debug(s"DELETE_CHUNK ${payload.subTaskId} $oldChunkPath")
+//      ________________________________________________________________________________
+        _              <- L.debug(newTask.toString)
+        _ <- if(newTask.subTasks.isEmpty) for{
+          _ <- L.debug(s"COMPRESSION_TASK_DONE $taskId ${timestamp-newTask.startedAt}")
+          _ <- L.debug(s"DELETE_ORIGINAL_FILE ${compressTask.filename}")
+          originalFile = new File(s"${ctx.config.sinkFolder}/$nodeId/${compressTask.id}/${compressTask.filename}")
+          _     <- liftFF[Unit,NodeError](IO.delay{originalFile.delete()} )
+          loadBalancerNode = Node(poolId,loadBalancerId)
+          loadBalancerPub  = fromNodeToPublisher(loadBalancerNode)
+          properties = AmqpProperties(headers = Map("commandId"->StringVal("BALANCE")))
+          msgPayload = Json.obj(
+            "fileId"-> compressTask.id.asJson,
+                    "userId" -> compressTask.userId.asJson,
+                     "chunks" -> newCompressTask.chunkLocations.asJson
+          ).noSpaces
+          message    = AmqpMessage[String](payload = msgPayload,properties = properties)
+          _          <- liftFF[Unit,NodeError](loadBalancerPub.publish(message))
+          _ <- L.debug("MESSAGE TO BALANCER")
+//          _  <-
+        } yield ()
         else unit
       } yield ()
       app.value.stopwatch.flatMap{ result=>
@@ -410,35 +531,70 @@ object CommandHandlers {
       implicit val rabbitMQContext = ctx.rabbitContext
 
       val app = for {
+//      CURRENT_STATE
         currentState         <- maybeCurrentState
+        //      GET COMPRESSION ALGORITTHM
         compressionAlgorithm = compression.fromString(payload.compressionAlgorithm)
-        source               = payload.sourcePath
-        sourcePath           = Paths.get(source)
+        //      NODE_ID
+        nodeId               = ctx.config.nodeId
+        fileId               = payload.fileId
+        chunkSink            = s"${ctx.config.sinkFolder}/$nodeId/$fileId/chunks"
+        chunkCompressedSink  = s"${ctx.config.sinkFolder}/$nodeId/$fileId/compressed"
+        chunkSinkPath        = Paths.get(chunkSink)
+        chunkCompressedSinkPath = Paths.get(chunkCompressedSink)
+        _                    = chunkCompressedSinkPath.toFile.mkdirs()
+        _                    = chunkSinkPath.toFile.mkdirs()
+        //      RESOURCE_URL
+        //      http://localhost:6000
+        url                  = new URL(payload.url)
+        //       /data/dp-0/FILE_ID/FILE_ID_CHUNK-INDEX
+        urlSource            = payload.source
+        urlSourcePath        = Paths.get(urlSource)
+        //      FILE_NAME = FILE_ID_CHUNK-INDEX  / EXTENSION = ""
+        urlSourceMetadata    = FileMetadata.fromPath(urlSourcePath)
+        chunkName            = urlSourceMetadata.fullname
+//       FILE_ID/FILE_ID_CHUNK-INDEX
+        chunkSinkDestination = chunkSinkPath.resolve(urlSourceMetadata.fullname)
+        chunkSinkDestinationFile = chunkSinkDestination.toFile
+        //      DOWNLOAD THE CHUNKS AND SAVE IN /FILE_ID/CHUNKS/FILE_ID_CHUNK-INDEX
+        _                    <- Client.downloadFileE(
+//        http://localhost:6000
+          url         = url.toString,
+//        /data/dp-0/FILE_ID/FILE_ID_CHUNK-INDEX
+          sourcePath  = urlSource,
+//
+          destination = chunkSinkDestination
+        )
+        //      ______________________________________________________________________
+        //        sourcePath           = Paths.get(source)
         replyTo              <- maybeReplyTo
         taskId               <- maybeMessageId
+        //
         publisher            <- EitherT.fromOption[IO].apply[NodeError,PublisherV2](currentState.publishers.get(replyTo),PublisherNotFound())
-        //       /data
-        sourceNameCount      = sourcePath.getNameCount
-        //       $FILE_ID
-        chunkName            = sourcePath.subpath(sourceNameCount-1,sourceNameCount).toString
-        //        /data/$FILE_ID/compressed
-        destinationPath      = Paths.get("/").resolve(sourcePath.subpath(0,sourceNameCount-2))
-          .resolve("compressed")
-        destinationFile      = destinationPath.toFile
         //       ________________________________________________
-        res <- liftFF[Boolean,E](IO.delay{destinationFile.mkdir()})
-        _ <- L.debug(s"SOURCE $source")
-        _ <- L.debug(s"SOURCE_EXISTS ${sourcePath.toFile.exists()}")
-        _ <- L.debug(s"CHUNK_NAME $chunkName")
-        _ <- L.debug(s"CHUNK_DESTINATION $destinationPath")
-        _ <- L.debug(s"CHUNK_DESTINATION_FILE $destinationFile")
-        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${destinationFile.exists()}")
-        _ <- L.debug(s"RES $res")
+        //        res <- liftFF[Boolean,E](IO.delay{destinationFile.mkdir()})
+        _ <- L.debug(s"URL ${payload.url}")
+        _ <- L.debug(s"SOURCE ${payload.source}")
+        _ <- L.debug(s"SOURCE_EXISTS ${urlSourcePath.toFile.exists()}")
+        _ <- L.debug(s"CHUNK_NAME ${urlSourceMetadata.fullname}")
+        _ <- L.debug(s"CHUNK_DESTINATION $chunkSinkDestination")
+        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${chunkSinkDestination.toFile.exists()}")
+        _ <- L.debug(s"CHUNK_COMPRESED_DESTINATION $chunkCompressedSink")
+        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${chunkSinkDestination.toFile.exists()}")
+        //        _ <- L.debug(s"RES $res")
         //       ___________________________________________________________
         result <- compression
-          .compress(compressionAlgorithm,source = source,destination = destinationPath.toString)
+          .compress(
+            compressionAlgorithm,
+            source = chunkSinkDestination.toString,
+            destination = chunkCompressedSink
+          )
           .leftMap(e=>CompressionError(e.getMessage))
+//          .flatMap(x=>)
+        //       _____________________________________________________
+        _ <- liftFF[Unit,NodeError](IO.delay{chunkSinkDestinationFile.delete()})
         _ <- L.debug(result.toString)
+//
       } yield (publisher,taskId,chunkName,result)
 //  _____________________________________________________________________________________
       app.value.stopwatch.flatMap {result=>
@@ -448,18 +604,19 @@ object CommandHandlers {
             case (publisher,taskId,chunkName,compressionStats) =>  for {
               _             <- acker.ack(envelope.deliveryTag)
               currentState  <- ctx.state.get
-              sourcePath    = Paths.get(payload.sourcePath)
-              chunkMetadata = FileMetadata.fromPath(sourcePath)
-              chunk         = sourcePath.toFile
-              deleteDelay   = 1200
+              port          = ctx.config.port
               properties    = AmqpProperties(
                 headers = Map("commandId"->StringVal("COMPRESS_COMPLETED")),
                 messageId = taskId.some
               )
-              messagePayload = CompressCompleted(chunkName).asJson.noSpaces
+              messagePayload = CompressCompleted(
+                subTaskId = chunkName,
+                source = compressionStats.fileOut,
+                url = s"http://${currentState.ip}:$port"
+              ).asJson.noSpaces
               message       = AmqpMessage[String](payload = messagePayload,properties = properties)
               _             <- publisher.publish(message)
-              _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkMetadata.filename} ${chunkMetadata.size.value.getOrElse(0)}")).start
+//              _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkMetadata.filename} ${chunkMetadata.size.value.getOrElse(0)}")).start
               _ <- ctx.logger.info(s"COMPRESSION_DATA ${result.duration}")
             } yield ()
           }
@@ -488,63 +645,78 @@ object CommandHandlers {
       implicit val rabbitMQContext = ctx.rabbitContext
 
       val app = for {
+//      CURRENT_STATE
+        _                    <- L.debug("DECOMPRESS_INIT")
         currentState         <- maybeCurrentState
+        nodeId               = ctx.config.nodeId
+        fileId               = payload.fileId
+//      REPLY_TO
         replyTo              <- maybeReplyTo
+//      PUBLISHER
         publishers           = currentState.publishers
         publisher            <- EitherT.fromOption[IO].apply(publishers.get(replyTo),PublisherNotFound())
+//      TASK_ID
         taskId               <- maybeMessageId
+//      COMPRESSION_ALGORITHM
         compressionAlgorithm = compression.fromString(payload.compressionAlgorithm)
-        source               = payload.sourcePath
-        sourcePath           = Paths.get(source)
-        //       /data
-        sourceNameCount      = sourcePath.getNameCount
-        //       $FILE_ID
-        chunkName            = sourcePath.subpath(sourceNameCount-1,sourceNameCount).toString
-        //        /data/$FILE_ID/compressed
-        destinationPath      = Paths.get("/").resolve(sourcePath.subpath(0,sourceNameCount-2))
-//          .resolve("decompressed")
-          .resolve("chunks")
-        destinationFile      = destinationPath.toFile
-        //       ________________________________________________
-        res <- liftFF[Boolean,E](IO.delay{destinationFile.mkdir()})
-        _ <- L.debug(s"SOURCE $source")
-        _ <- L.debug(s"SOURCE_EXISTS ${sourcePath.toFile.exists()}")
-        _ <- L.debug(s"CHUNK_NAME $chunkName")
-        _ <- L.debug(s"CHUNK_DESTINATION $destinationPath")
-        _ <- L.debug(s"CHUNK_DESTINATION_FILE $destinationFile")
-        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${destinationFile.exists()}")
-        _ <- L.debug(s"DESTINATION_MKDIR_RESULT $res")
-        //       ___________________________________________________________
-        result <- compression
-          .decompress(compressionAlgorithm,source = source,destination = destinationPath.toString)
-          .leftMap(e=>CompressionError(e.getMessage))
-        _ <- L.debug(result.toString)
-      } yield (publisher,result,taskId)
+//       SINK_FOLDER
+        sinkFolder           = s"${ctx.config.sinkFolder}/$nodeId/$fileId/compressed"
+        sinkFolderPath       = Paths.get(sinkFolder)
+        _                    = sinkFolderPath.toFile.mkdirs()
+        sinkUnCompressed     = s"${ctx.config.sinkFolder}/$nodeId/$fileId/chunks"
+        sinkUnCompressedPath = Paths.get(sinkUnCompressed)
+//
+        compressedChunks     = payload.compressedChunksLocations
+
+//     DOWNLOAD_COMPRESSED_CHUNKS
+        chunksMetadata       <- liftFF[List[FileMetadata],NodeError](
+          Helpers.downloadCompressedChunks(compressedChunks,sinkFolderPath)
+        )
+        _ <- L.debug("DOWNLOAD_CHUNKS!")
+
+        chunksNames = chunksMetadata.map(_.fullname)
+        sources = chunksNames
+          .map(sinkFolderPath.resolve)
+
+        destinations = chunksMetadata.map(_.filename.value).map(_=>sinkUnCompressedPath)
+        sourcesAndDestinations = sources zip destinations
+
+        results  <- sourcesAndDestinations.traverse {
+            case (source, dest) =>
+            compression
+              .decompress(ca = compressionAlgorithm,
+                source = source.toString,
+                destination = dest.toString
+              )
+              .leftMap(e=>CompressionError(e.getMessage))
+
+          }
+//        _ <- EitherT.apply[IO,NodeError,List[DecompressionStats]](results)
+
+        properties  = AmqpProperties(
+          headers   = Map("commandId"->StringVal("DECOMPRESS_COMPLETED")),
+          replyTo   = publisher.pubId.some,
+          messageId = taskId.some
+        )
+        messagePayloads = chunksMetadata.map(chm=>payloads.DecompressCompleted(subTaskId = chm.filename.value).asJson.noSpaces)
+        messages        = messagePayloads.map(mp=>AmqpMessage[String](payload= mp,properties = properties))
+        x               <- liftFF[Unit,NodeError](rabbitMQContext.client.createChannel(rabbitMQContext.connection).use{ implicit channel=>
+           messages.traverse(m => publisher.publishWithChannel(m)).void
+        })
+//        _ <- L.debug(results.mkString(","))
+      } yield (publisher,taskId)
 
       app.value.stopwatch.flatMap {result=>
         result.result match {
           case Left(e) =>  ctx.logger.error(e.getMessage) *> acker.reject(envelope.deliveryTag)
           case Right(value) => for {
             _ <- acker.ack(envelope.deliveryTag)
-            publisher          = value._1
-            decompressionStats = value._2
-            taskId             = value._3
+//            publisher          = value._1
+//            decompressionStats = value._2
+//            taskId             = value._3
 //          DELETE_COMPRESSED_FILE
-            sourcePath    = Paths.get(payload.sourcePath)
-            chunkMetadata = FileMetadata.fromPath(sourcePath)
-            chunk         = sourcePath.toFile
-            deleteDelay    = 1200
-
-            properties  = AmqpProperties(
-              headers   = Map("commandId"->StringVal("DECOMPRESS_COMPLETED")),
-              replyTo   = publisher.pubId.some,
-              messageId = taskId.some
-            )
-            messagePayload = payloads.DecompressCompleted(subTaskId = chunkMetadata.filename.value).asJson.noSpaces
-            message       = AmqpMessage[String](payload= messagePayload,properties = properties)
-            _             <- publisher.publish(message)
 //          _________________________________________________________________________________________
-            _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkMetadata.filename} ${chunkMetadata.size.value.getOrElse(0)}")).start
+//            _ <- (IO.sleep(deleteDelay milliseconds)*>IO.delay{chunk.delete()} *> ctx.logger.info(s"DELETE_CHUNK ${chunkMetadata.filename} ${chunkMetadata.size.value.getOrElse(0)}")).start
             _ <- ctx.logger.info(s"DECOMPRESSION_DATA ${result.duration}")
 //            _ <- ctx.logger.debug(s"REPLY_TO ${}")
           } yield ()
@@ -572,37 +744,45 @@ object CommandHandlers {
       val L                        = Logger.eitherTLogger[IO,E]
       implicit val rabbitMQContext = ctx.rabbitContext
       val app = for {
+//      TIMESTAMP
         timestamp    <- liftFF[Long,NodeError](IO.realTime.map(_.toSeconds))
+//      CURRENT STATE
         currentState <- maybeCurrentState
+//      REPLY_TO
         replyTo      <- maybeReplyTo
+//      TASK_ID
         taskId       <- maybeMessageId
+//
         _            <- L.debug(s"DECOMPRESS_COMPLETED $taskId ${payload.subTaskId}")
         _            <- L.debug(currentState.pendingTasks.mkString(","))
+//
         task         <-  EitherT.fromEither[IO](currentState.pendingTasks.get(taskId).toRight{TaskNotFound(taskId)})
         decompressTask = task.asInstanceOf[DecompressionTask]
         updatedTask  = decompressTask.copy(subTasks = decompressTask.subTasks.filter(_.id!= payload.subTaskId))
+//      NEW_STATE
         newState     <- liftFF[NodeState,NodeError]{
           ctx.state.updateAndGet(s=>s.copy(pendingTasks =  s.pendingTasks.updated(taskId,updatedTask) ))
         }
         newTask     <- EitherT.fromOption[IO].apply[NodeError,Task](newState.pendingTasks.get(taskId),TaskNotFound(taskId))
 //        masterNodeId = decompressTask.mn
-        mergeMsgProperties = AmqpProperties(
-          headers = Map("commandId"->StringVal("MERGE")),
-          replyTo = replyTo.some
-        )
+//        mergeMsgProperties = AmqpProperties(
+//          headers = Map("commandId"->StringVal("MERGE")),
+//          replyTo = replyTo.some
+//        )
         _           <- L.debug(newTask.toString)
-        _ <- if(newTask.subTasks.isEmpty) for{
-//          _            <- L.debug(s"DECOMPRESSION_TASK_DONE $taskId ${timestamp-newTask.startedAt}")
-          publisher       <- EitherT.fromOption[IO].apply[NodeError,PublisherV2](currentState.publishers.get(replyTo),PublisherNotFound())
-          sourcePath      = decompressTask.sourcePath
-          filename        = decompressTask.filename.value
-          extension       = decompressTask.extension.value
-          mergeMsgPayload = payloads.Merge(sourcePath = sourcePath,filename = filename,extension = extension).asJson.noSpaces
-          mergeMessage    = AmqpMessage[String](payload= mergeMsgPayload, properties = mergeMsgProperties)
-          _               <- liftFF[Unit,NodeError](publisher.publish(mergeMessage))
-//          _ <-
-        } yield()
+        _ <- if(newTask.subTasks.isEmpty) L.debug("FINISH_DECOMPRESSION")
         else unit
+////          _            <- L.debug(s"DECOMPRESSION_TASK_DONE $taskId ${timestamp-newTask.startedAt}")
+//          publisher       <- EitherT.fromOption[IO].apply[NodeError,PublisherV2](currentState.publishers.get(replyTo),PublisherNotFound())
+//          sourcePath      = decompressTask.sourcePath
+//          filename        = decompressTask.filename.value
+//          extension       = decompressTask.extension.value
+//          mergeMsgPayload = payloads.Merge(sourcePath = sourcePath,filename = filename,extension = extension).asJson.noSpaces
+//          mergeMessage    = AmqpMessage[String](payload= mergeMsgPayload, properties = mergeMsgProperties)
+//          _               <- liftFF[Unit,NodeError](publisher.publish(mergeMessage))
+////          _ <-
+//        } yield()
+//        else unit
       } yield ()
       app.value.stopwatch.flatMap{ result=>
         result.result match {

@@ -10,12 +10,20 @@ object Dependencies {
     lazy val Log4Cats =   "org.typelevel" %% "log4cats-slf4j"   % "2.1.1"
     lazy val ScalaCompress = "com.github.gekomad" %% "scala-compress" % "1.0.0"
     lazy val ApacheCommonsIO = "commons-io" % "commons-io" % "2.11.0"
+    val http4sVersion = "1.0.0-M23"
+    lazy val Http4s =Seq(
+      "org.http4s" %% "http4s-dsl" ,
+      "org.http4s" %% "http4s-blaze-server" ,
+      "org.http4s" %% "http4s-blaze-client",
+      "org.http4s" %% "http4s-circe"
+    ).map(_ % http4sVersion)
+//
     val fs2Version = "3.0.6"
     lazy val Fs2 = Seq(
       "co.fs2" %% "fs2-core",
       "co.fs2" %% "fs2-io"
     ).map(_%fs2Version)
-    Seq(RabbitMQUtils,PureConfig,Commons,MUnitCats,Log4Cats,ScalaCompress,ApacheCommonsIO)++Fs2
+    Seq(RabbitMQUtils,PureConfig,Commons,MUnitCats,Log4Cats,ScalaCompress,ApacheCommonsIO)++Fs2++Http4s
   }
 }
 

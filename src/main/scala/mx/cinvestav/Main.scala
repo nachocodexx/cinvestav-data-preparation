@@ -6,12 +6,15 @@ import dev.profunktor.fs2rabbit.model.{ExchangeName, QueueName, RoutingKey}
 import mx.cinvestav.Declarations.{NodeContext, NodeState, Task}
 import mx.cinvestav.commons.balancer.LoadBalancer
 import mx.cinvestav.config.DefaultConfig
+import mx.cinvestav.server.HttpServer
 import mx.cinvestav.utils.RabbitMQUtils
 import mx.cinvestav.utils.v2.{Acker, Exchange, MessageQueue, PublisherConfig, PublisherV2, RabbitMQContext}
 import org.typelevel.log4cats.{Logger, SelfAwareStructuredLogger}
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import pureconfig._
 import pureconfig.generic.auto._
+
+import java.net.InetAddress
 
 object Main extends IOApp{
   implicit val config:DefaultConfig = ConfigSource.default.loadOrThrow[DefaultConfig]
@@ -82,11 +85,13 @@ object Main extends IOApp{
             sourceFolders = config.sourceVolumes,
             publishers    = publishers,
             loadBalancer  = LoadBalancer("RB"),
-            pendingTasks = Map.empty[String,Task]
+            pendingTasks = Map.empty[String,Task],
+            ip = InetAddress.getLocalHost.getHostAddress,
           )
           state           <- IO.ref(initState)
           context         = NodeContext(state=state,rabbitContext = rabbitContext,logger = unsafeLogger,config=config)
-          _             <- mainProgram(queueName = queueName)(ctx=context)
+          _             <- mainProgram(queueName = queueName)(ctx=context).start
+          _             <- HttpServer.run()(ctx=context)
         } yield ()
       }
     }.as(ExitCode.Success)
