@@ -3,7 +3,8 @@ import cats.effect.{ExitCode, IO, IOApp}
 import dev.profunktor.fs2rabbit.config.Fs2RabbitConfig
 import dev.profunktor.fs2rabbit.model.AmqpFieldValue.StringVal
 import dev.profunktor.fs2rabbit.model.{ExchangeName, QueueName, RoutingKey}
-import mx.cinvestav.Declarations.{NodeContext, NodeState, Task}
+import mx.cinvestav.Declarations.{NodeContext,NodeState}
+import mx.cinvestav.commons.types.Task
 import mx.cinvestav.commons.balancer.LoadBalancer
 import mx.cinvestav.config.DefaultConfig
 import mx.cinvestav.server.HttpServer
@@ -39,10 +40,10 @@ object Main extends IOApp{
 //            _________________________________________________________________________________________________
               case StringVal(value) if (value =="MERGE_DECOMPRESS") => CommandHandlers.mergeAndDecompress()
               case StringVal(value)  if (value == "MERGE")=> CommandHandlers.merge()
-//              case StringVal(value)  if (value == "MERGE_COMPLETED")=> CommandHandlers.mergeCompleted()
               case StringVal(value)  if (value == "DECOMPRESS")=> CommandHandlers.decompress()
               case StringVal(value)  if (value == "DECOMPRESS_COMPLETED")=> CommandHandlers.decompressCompleted()
-              //        _ <- L.debug(s"MERGE_COMPRESS ${payload.sourcePath}")
+//            _________________________________________________________________________________________________
+              case StringVal(value) if (value=="DELETE_FILE") => CommandHandlers.deleteFile()
               case StringVal(value)   => ctx.logger.error(s"COMMAND_ID[$value] NOT MATCH") *> acker.reject(envelope.deliveryTag)
             }
             case None => for {
@@ -64,9 +65,9 @@ object Main extends IOApp{
           poolId          = config.poolId
           nodeId          = config.nodeId
 //        ____________________________________________________________________________
-          exchangeName  = ExchangeName(s"$poolId-data_preparation")
-          queueName     = QueueName(s"$poolId-$nodeId")
-          routingKey    = RoutingKey(s"$poolId.$nodeId")
+          exchangeName  = ExchangeName(config.exchangeName)
+          queueName     = QueueName(nodeId)
+          routingKey    = RoutingKey(nodeId)
 //         ______________________________________________________________-
           exchange      <- Exchange.topic(exchangeName = exchangeName)
           queue         <- MessageQueue.createThenBind(
@@ -76,17 +77,22 @@ object Main extends IOApp{
           )
           //         __________________________________________________________
           publishers      = config.dataPreparationNodes.map{ node=>
-            val routingKey = RoutingKey(s"${config.poolId}.${node.nodeId}")
+            val routingKey = RoutingKey(node.nodeId)
             (node.nodeId,PublisherConfig(exchangeName = exchangeName,routingKey = routingKey))
           }
             .map(x=>x.copy(_2 = PublisherV2.create(x._1,x._2)))
             .toMap
           initState       = NodeState(
-            sourceFolders = config.sourceVolumes,
             publishers    = publishers,
             loadBalancer  = LoadBalancer("RB"),
             pendingTasks = Map.empty[String,Task],
             ip = InetAddress.getLocalHost.getHostAddress,
+            loadBalancerPublisher = PublisherV2(
+              PublisherConfig(
+                exchangeName = ExchangeName(config.loadBalancer.exchange),
+                routingKey =  RoutingKey(config.loadBalancer.routingKey)
+              )
+            )
           )
           state           <- IO.ref(initState)
           context         = NodeContext(state=state,rabbitContext = rabbitContext,logger = unsafeLogger,config=config)

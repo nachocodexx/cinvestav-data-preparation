@@ -26,11 +26,6 @@ ________________________MERGE_______________________
   "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-0/c5a4dc33-6c23-4819-91f9-6881849831aa/decompressed"
 }
 ________________________SLICE_COMPRESS_______________________
-{
-  "sourcePath":"/home/nacho/Programming/Scala/data-preparation/target/sources/00.pdf",
-  "chunkSize":64000000,
-  "compressionAlgorithm":"LZ4"
-}
 ____________________V2_______________________
 {
   "url":"http://localhost:6000/1.pdf",
@@ -68,4 +63,51 @@ ________________________MERGE_DECOMPRESS_______________________
   "filename":"my_book",
   "extension":"pdf",
   "compressionAlgorithm":"LZ4"
+}
+________________________________________________________________________
+________________________________________________________________________
+{
+  "fileId":"07709311-67bf-4717-822d-a70767902010",
+  "compressedChunks":[
+    {
+      "url":"http://localhost:7002/download",
+      "sources":[
+          "/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-1/07709311-67bf-4717-822d-a70767902010/compressed/07709311-67bf-4717-822d-a70767902010_0.lz4",
+          "/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-1/07709311-67bf-4717-822d-a70767902010/compressed/07709311-67bf-4717-822d-a70767902010_2.lz4"
+       ]
+    },
+    {
+      "url":"http://localhost:7003/download",
+      "sources":[
+          "/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-2/07709311-67bf-4717-822d-a70767902010/compressed/07709311-67bf-4717-822d-a70767902010_1.lz4"
+       ]
+    }
+  ],
+  "compressionAlgorithm":"LZ4",
+  "filename":"my_book",
+  "extension":"pdf"
+}
+
+________________________________________________________
+
+{
+  "fileId":"864484ee-4d24-4bee-8320-36aa27ea4c46",
+  "compressedChunks":[
+    {
+      "url":"http://localhost:7002/download",
+      "sources":[
+          "/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-1/864484ee-4d24-4bee-8320-36aa27ea4c46/compressed/864484ee-4d24-4bee-8320-36aa27ea4c46_0.lz4",
+          "/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-1/864484ee-4d24-4bee-8320-36aa27ea4c46/compressed/864484ee-4d24-4bee-8320-36aa27ea4c46_2.lz4"
+       ]
+    },
+    {
+      "url":"http://localhost:7003/download",
+      "sources":[
+          "/home/nacho/Programming/Scala/data-preparation/target/sink/data/dp-2/864484ee-4d24-4bee-8320-36aa27ea4c46/compressed/864484ee-4d24-4bee-8320-36aa27ea4c46_1.lz4"
+       ]
+    }
+  ],
+  "compressionAlgorithm":"LZ4",
+  "filename":"my_book",
+  "extension":"pdf"
 }

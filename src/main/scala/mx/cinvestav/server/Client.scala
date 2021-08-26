@@ -14,7 +14,7 @@ import org.http4s.implicits._
 import io.circe._
 import io.circe.generic.auto._
 import io.circe.syntax._
-import mx.cinvestav.Declarations.DownloadError
+import mx.cinvestav.commons.errors.DownloadError
 
 import java.nio.file.Path
 import scala.concurrent.ExecutionContext.global

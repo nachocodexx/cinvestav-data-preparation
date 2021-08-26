@@ -25,6 +25,8 @@ object Routes {
       source     = payload.source
       path       = Paths.get(source)
       file       = path.toFile
+//      _          <- ctx.logger.debug(s"PATH $path")
+//      _          <- ctx.logger.debug(s"PATH ${file.exists()}")
       response   <- if(!file.exists())  NotFound()
       else for {
         _        <- ctx.logger.debug(s"FILE_PATH $path")
