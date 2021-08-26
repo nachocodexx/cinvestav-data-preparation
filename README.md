@@ -6,5 +6,5 @@ The following figure shows the Directed Acyclic Graph(DAG) of **N** data prepara
 implicit parallelism.
 
 <p align="center">
-  <img width="550" height="350" src="https://github.com/nachocodexx/cinvestav-data-preparation/tree/master/images/dag.png">
+  <img width="550" height="350" src="https://i.imgur.com/ShsEclQ.png">
 </p>
