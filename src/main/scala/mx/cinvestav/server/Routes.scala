@@ -20,6 +20,21 @@ object Routes {
   def hello(implicit ctx:NodeContext): HttpRoutes[IO] = HttpRoutes.of[IO]{
     case req@GET -> Root   =>
       Ok(s"Hello I'm ${ctx.config.nodeId}")
+    case req@GET ->  "v2" /: filePath => for {
+      _ <- IO.unit
+      path       = Paths.get(filePath.toAbsolute.toString())
+      file       = path.toFile
+      _          <- ctx.logger.debug(s"FILE_PATH $path")
+      response   <- if(!file.exists())  NotFound()
+      else for {
+        _        <- ctx.logger.debug(s"FILE_SIZE ${file.length()} bytes")
+        metadata = FileMetadata.fromPath(path)
+        _        <- ctx.logger.debug(s"FILE_EXTENSION ${metadata.extension}")
+        bytes    = Files[IO].readAll(path,4098)
+        _        <- ctx.logger.info(s"DOWNLOAD ${metadata.fullname} ${metadata.size.value.get}")
+        response <- Ok(bytes)
+      } yield response
+    } yield response
     case req@POST -> Root / "download"  => for{
       payload    <- req.as[DownloadPayload]
       source     = payload.source

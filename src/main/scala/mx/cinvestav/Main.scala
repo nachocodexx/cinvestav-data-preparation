@@ -64,24 +64,23 @@ object Main extends IOApp{
           implicit0(rabbitContext:RabbitMQContext)   <- IO.pure(RabbitMQContext(client=client,connection=connection))
           poolId          = config.poolId
           nodeId          = config.nodeId
-//        ____________________________________________________________________________
+          // ____________________________________________________________________________
           exchangeName  = ExchangeName(config.exchangeName)
           queueName     = QueueName(nodeId)
           routingKey    = RoutingKey(nodeId)
-//         ______________________________________________________________-
+          //  ______________________________________________________________-
           exchange      <- Exchange.topic(exchangeName = exchangeName)
           queue         <- MessageQueue.createThenBind(
             queueName = queueName,
             exchangeName = exchangeName,
             routingKey = routingKey
           )
-          //         __________________________________________________________
+          // __________________________________________________________
           publishers      = config.dataPreparationNodes.map{ node=>
             val routingKey = RoutingKey(node.nodeId)
             (node.nodeId,PublisherConfig(exchangeName = exchangeName,routingKey = routingKey))
-          }
-            .map(x=>x.copy(_2 = PublisherV2.create(x._1,x._2)))
-            .toMap
+          }.map(x=>x.copy(_2 = PublisherV2.create(x._1,x._2))).toMap
+          //  ____________________________________________________________________________________
           initState       = NodeState(
             publishers    = publishers,
             loadBalancer  = LoadBalancer("RB"),

@@ -12,6 +12,12 @@ import java.nio.file.{Path, Paths}
 
 object Helpers {
 
+
+  def compress()= {
+
+  }
+
+
   def downloadUncompressedChunks(
                                 compressedChunkLocation: List[ChunkMetadata],
                                 destination:Path

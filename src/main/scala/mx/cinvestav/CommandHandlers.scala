@@ -45,7 +45,6 @@ import java.nio.file.Paths
 object CommandHandlers {
 //  SLICE & COMPRESS
   def sliceAndCompress()(implicit ctx:NodeContext,envelope: AmqpEnvelope[String],acker: Acker): IO[Unit] = {
-
     def successCallback(payload:payloads.SliceAndCompress) = {
       type E                       = NodeError
       val unit                     = liftFF[Unit,NodeError](IO.unit)
@@ -135,10 +134,11 @@ object CommandHandlers {
           allowRep = true,
           _counter =  Map.empty[String,Int]
         )
-        //
+        // CREATE PUBLISHER
         pubs                   <- EitherT.fromEither[IO](balancedNodes.traverse(currentState.publishers.get).toRight{PublisherNotFound()})
         pubsStream             = Stream.emits(pubs).covary[IO]
         //      ________________________________________________________________________________________________________________
+        // SEND CHUNKS TO COMPRESSION
         compressChunks = rabbitMQContext.client.createChannel(conn = rabbitMQContext.connection)  .use{ implicit channel =>
           sliceStream.zip(pubsStream).evalMap{
             case (chunkInfo, publisher) =>
@@ -227,10 +227,13 @@ object CommandHandlers {
         currentState         <- maybeCurrentState
         //      GET COMPRESSION ALGORITTHM
         compressionAlgorithm = compression.fromString(payload.compressionAlgorithm)
-        //      NODE_ID
+        // NODE_ID
         nodeId                  = ctx.config.nodeId
+        // FILE_ID
         fileId                  = payload.fileId
+        // NODE_PORT
         port                    = ctx.config.port
+        //
         chunkSink               = s"${ctx.config.sinkFolder}/$nodeId/$fileId/chunks"
         chunkCompressedSink     = s"${ctx.config.sinkFolder}/$nodeId/$fileId/compressed"
         chunkSinkPath           = Paths.get(chunkSink)
@@ -273,7 +276,6 @@ object CommandHandlers {
           )
           .leftMap(e=>CompressionError(e.getMessage))
         //       ________________________________________________
-        //        res <- liftFF[Boolean,E](IO.delay{destinationFile.mkdir()})
         compressedChunkFile = chunkCompressedSinkPath.toFile
         _ <- L.info(s"COMPRESSION_LATENCY $fileId $taskId ${timestamp-payload.timestamp}")
         _ <- L.debug(s"URL ${payload.url}")
@@ -283,10 +285,7 @@ object CommandHandlers {
         _ <- L.debug(s"CHUNK_INDEX ${payload.chunkIndex}")
         _ <- L.debug(s"CHUNK_SIZE ${compressedChunkFile.length()}")
         _ <- L.debug(s"CHUNK_DESTINATION $chunkSinkDestination")
-        //        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${chunkSinkDestination.toFile.exists()}")
-        _ <- L.debug(s"CHUNK_COMPRESED_DESTINATION $chunkCompressedSink")
-        //        _ <- L.debug(s"CHUNK_DESTINATION_EXISTS ${chunkSinkDestination.toFile.exists()}")
-        //       ___________________________________________________________
+        _ <- L.debug(s"CHUNK_COMPRESSED_DESTINATION $chunkCompressedSink")
         //        ___________________________
         nodeUrl = s"http://${currentState.ip}:$port/download"
         chunkMetadata = ChunkMetadata(
